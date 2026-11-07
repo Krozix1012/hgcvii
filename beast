@@ -53433,8 +53433,144 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 		end
 	end
 
+	-- HuiG Sync: players running HuiG see each other's car and cape. Clients can't message each other, but an
+	-- animation played on your own character replicates to everyone, so an effect that's on plays an invisible
+	-- marker animation (weight ~0) whose speed is the effect's code. Every HuiG client watches the other players
+	-- for those markers and builds the effect on their character locally. Kept on tbl12 rather than a local: the
+	-- main function is at Luau's 200-local limit.
+	do
+		local HuiGSync = {}
+		tbl12.HuiGSync = HuiGSync
+		local Players = game:GetService("Players")
+		local MARKER_ID = "182393478" -- stock R6 "toolnone" animation: every client can load it
+		local CODES = { car = 0.031, cape = 0.047 }
+		local builders = {} -- name -> function(player) -> stop function
+		local wanted, mine = {}, {} -- our own effects that are on, and their marker tracks
+		local shown = {} -- other player -> name -> stop function (or true while building)
+
+		local function animatorOf(character)
+			local hum = character and character:FindFirstChildOfClass("Humanoid")
+			return hum and hum:FindFirstChildOfClass("Animator")
+		end
+
+		local function playMarker(name)
+			local old = mine[name]
+			if old then
+				pcall(function()
+					old:Stop(0)
+				end)
+				mine[name] = nil
+			end
+			local animator = animatorOf(Players.LocalPlayer.Character)
+			if not animator then
+				return
+			end
+			local anim = Instance.new("Animation")
+			anim.AnimationId = "rbxassetid://" .. MARKER_ID
+			pcall(function()
+				local track = animator:LoadAnimation(anim)
+				track.Priority = Enum.AnimationPriority.Core
+				track.Looped = true
+				track:Play(0, 0.001, CODES[name])
+				mine[name] = track
+			end)
+		end
+
+		function HuiGSync.Register(name, build)
+			builders[name] = build
+		end
+
+		function HuiGSync.SetLocal(name, on)
+			wanted[name] = on or nil
+			if on then
+				playMarker(name)
+			elseif mine[name] then
+				pcall(function()
+					mine[name]:Stop(0)
+				end)
+				mine[name] = nil
+			end
+		end
+
+		local function drop(list, name)
+			local stop = list[name]
+			list[name] = nil
+			if type(stop) == "function" then
+				pcall(stop)
+			end
+		end
+
+		task.spawn(function()
+			while not flag11 do
+				-- our markers die with the character: put them back after a respawn
+				for name in pairs(wanted) do
+					local track = mine[name]
+					if not (track and track.IsPlaying) then
+						playMarker(name)
+					end
+				end
+				for _, player in ipairs(Players:GetPlayers()) do
+					if player ~= Players.LocalPlayer then
+						local found = {}
+						local animator = animatorOf(player.Character)
+						if animator then
+							for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+								local id = track.Animation and track.Animation.AnimationId or ""
+								if id:sub(-#MARKER_ID) == MARKER_ID then
+									for name, code in pairs(CODES) do
+										if math.abs(track.Speed - code) < 0.004 then
+											found[name] = true
+										end
+									end
+								end
+							end
+						end
+						local list = shown[player] or {}
+						shown[player] = list
+						for name, build in pairs(builders) do
+							if found[name] and not list[name] then
+								list[name] = true
+								task.spawn(function()
+									local ok, stop = pcall(build, player)
+									stop = ok and type(stop) == "function" and stop or nil
+									if list[name] == true and shown[player] == list then
+										list[name] = stop or function() end
+									elseif stop then
+										pcall(stop) -- turned off while it was loading
+									end
+								end)
+							elseif not found[name] and list[name] then
+								drop(list, name)
+							end
+						end
+					end
+				end
+				for player, list in pairs(shown) do
+					if player.Parent ~= Players then
+						for name in pairs(list) do
+							drop(list, name)
+						end
+						shown[player] = nil
+					end
+				end
+				task.wait(0.5)
+			end
+			-- unloaded
+			for _, list in pairs(shown) do
+				for name in pairs(list) do
+					drop(list, name)
+				end
+			end
+			table.clear(shown)
+			for name in pairs(mine) do
+				HuiGSync.SetLocal(name, false)
+			end
+		end)
+	end
+
 	do
 		local Fun = tbl15.Fun
+		local HuiGSync = tbl12.HuiGSync
 		if Fun then
 			local Players = game:GetService("Players")
 			local RunService = game:GetService("RunService")
@@ -53742,6 +53878,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				end
 				local c = car
 				car = nil
+				HuiGSync.SetLocal("car", false)
 				c.conn:Disconnect()
 				if c.sitTrack then
 					c.sitTrack:Stop()
@@ -53850,6 +53987,70 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				return smoke
 			end
 
+			-- strip the chassis physics (suspension, motors, thrusters, scripts) and work out the driver frame: the seat
+			-- facing its LookVector, or the bounding box turned around when there's no seat. Shared by your own car and
+			-- the copies of other players' cars, so both line up with the driver the same way.
+			local function carFrame(model)
+				local seat = nil
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("BodyMover") or d:IsA("Script") or d:IsA("LocalScript") then
+						d:Destroy()
+					elseif d:IsA("VehicleSeat") or d:IsA("Seat") then
+						if not seat or (d:IsA("VehicleSeat") and not seat:IsA("VehicleSeat")) then
+							seat = d
+						end
+					end
+				end
+				local frame
+				if seat then
+					local flat = Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z).Unit
+					frame = CFrame.lookAt(seat.Position, seat.Position + flat)
+				else
+					local box = model:GetBoundingBox()
+					frame = CFrame.new(box.Position) * box.Rotation * CFrame.Angles(0, math.pi, 0)
+				end
+				return seat, frame
+			end
+
+			-- Other HuiG players' cars (HuiG Sync): the same model, anchored and posed from their body every frame.
+			-- The driver is always welded at a fixed offset above the driver point, so the body alone places the car.
+			local remoteCarTemplate = nil
+			HuiGSync.Register("car", function(player)
+				if not remoteCarTemplate then
+					remoteCarTemplate = loadAsset(VEHICLES.Car["Koenigsegg Jesko Attack"])
+				end
+				if not remoteCarTemplate then
+					return nil
+				end
+				local model = remoteCarTemplate:Clone()
+				local _, frame = carFrame(model)
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("BasePart") then
+						d.Anchored = true
+						d.CanCollide = false
+						d.CanQuery = false
+						d.CanTouch = false
+					elseif d:IsA("Seat") or d:IsA("VehicleSeat") then
+						d.Disabled = true
+					end
+				end
+				local toPivot = frame:ToObjectSpace(model:GetPivot())
+				local driverToCar = CFrame.new(0, -(SEAT_DROP - DRIVER_LOWER), 0)
+				model.Name = "HuiGRemoteCar"
+				model.Parent = workspace
+				local conn = RunService.RenderStepped:Connect(function()
+					local character = player.Character
+					local hrp = character and character:FindFirstChild("HumanoidRootPart")
+					if hrp then
+						model:PivotTo(hrp.CFrame * driverToCar * toPivot)
+					end
+				end)
+				return function()
+					conn:Disconnect()
+					model:Destroy()
+				end
+			end)
+
 			local vehicleToken = 0
 			local function spawnVehicle()
 				despawnVehicle()
@@ -53880,27 +54081,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					end)
 				end
 
-				-- strip the chassis physics (suspension, motors, thrusters, scripts); find the driver seat
-				local seat = nil
-				for _, d in ipairs(model:GetDescendants()) do
-					if d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("BodyMover") or d:IsA("Script") or d:IsA("LocalScript") then
-						d:Destroy()
-					elseif d:IsA("VehicleSeat") or d:IsA("Seat") then
-						if not seat or (d:IsA("VehicleSeat") and not seat:IsA("VehicleSeat")) then
-							seat = d
-						end
-					end
-				end
-
-				-- driver frame: the seat facing its LookVector, or the bounding box turned around when there's no seat
-				local frame
-				if seat then
-					local flat = Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z).Unit
-					frame = CFrame.lookAt(seat.Position, seat.Position + flat)
-				else
-					local box = model:GetBoundingBox()
-					frame = CFrame.new(box.Position) * box.Rotation * CFrame.Angles(0, math.pi, 0)
-				end
+				local seat, frame = carFrame(model)
 
 				-- ride height and footprint from visible parts near the driver, so display stands or stray props don't count
 				local lowest, lo, hi = nil, nil, nil
@@ -54420,21 +54601,9 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					end
 				end)
 
-				-- sit in the real seat; fall back to welding the root on top of the driver point
-				if seat then
-					seat.Disabled = false
-					root.CFrame = seat.CFrame * CFrame.new(0, SEAT_DROP, 0)
-					pcall(function()
-						seat:Sit(humanoid)
-					end)
-					task.wait(0.15)
-					seated = car ~= nil and car.root == carRoot and humanoid.SeatPart == seat
-					local seatWeld = seated and seat:FindFirstChild("SeatWeld")
-					if seatWeld then
-						car.driverWeld, car.driverBase = seatWeld, seatWeld.C0
-					end
-				end
-				if not seated and car and car.root == carRoot then
+				-- weld the driver on top of the driver point (always this way, not the model's seat: other HuiG players
+				-- place your car from your body alone, so the offset must be fixed)
+				if car and car.root == carRoot then
 					humanoid.Sit = true
 					local weld = Instance.new("Weld")
 					weld.Part0 = carRoot
@@ -54445,6 +54614,9 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				end
 				readSettings()
 				applySeatHeight()
+				if car and car.root == carRoot then
+					HuiGSync.SetLocal("car", true)
+				end
 			end
 
 			local GarageBox = Fun:AddRightTabbox("Vehicle Garage")
@@ -58975,13 +59147,14 @@ end
 
         do
             local CapeBox = Peak:AddRightGroupbox("<b>Cape</b>", "shirt")
+            local HuiGSync = tbl12.HuiGSync
             local capeHideFirstPerson = true
             local function capeStop()
                 local stop = getgenv().HuiGCapeStop
                 if stop then pcall(stop) end
             end
-            local function capeStart()
-                capeStop()
+            -- builds the cape on `player`'s character; returns a stop function
+            local function buildCape(player, isLocal)
                 local W, H, ROWS, D, RIM = 2, 3.2, 8, 0.08, 0.06
                 local rowH = H / ROWS
                 local RIM_COLOR = Color3.fromRGB(185, 185, 195)
@@ -59088,12 +59261,12 @@ end
                 local phase, clock = 0, 0
                 local cfs = table.create(#parts)
                 local conn = RunService.RenderStepped:Connect(function(dt)
-                    local char = LocalPlayer.Character
+                    local char = player.Character
                     local torso = char and (char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"))
                     local root = char and char:FindFirstChild("HumanoidRootPart")
                     local head = char and char:FindFirstChild("Head")
                     local cam = workspace.CurrentCamera
-                    local firstPerson = capeHideFirstPerson and head and cam
+                    local firstPerson = isLocal and capeHideFirstPerson and head and cam
                         and (head.LocalTransparencyModifier > 0.5 or (cam.CFrame.Position - head.Position).Magnitude < 1.5)
                     local show = torso ~= nil and root ~= nil and not firstPerson
                     folder.Parent = show and workspace or nil
@@ -59150,16 +59323,30 @@ end
                     local sweep = Vector2.new(-1.2 + ((clock % 4) / 1.4) * 2.4, 0)
                     for _, g in ipairs(shines) do g.Offset = sweep end
                 end)
-                getgenv().HuiGCapeStop = function()
+                return function()
                     conn:Disconnect()
                     folder:Destroy()
+                end
+            end
+            -- your cape, plus the HuiG Sync marker so other HuiG players see it too
+            local function capeStart()
+                capeStop()
+                local stopCape = buildCape(LocalPlayer, true)
+                HuiGSync.SetLocal("cape", true)
+                getgenv().HuiGCapeStop = function()
+                    stopCape()
+                    HuiGSync.SetLocal("cape", false)
                     getgenv().HuiGCapeStop = nil
                 end
             end
+            -- other HuiG players' capes, built on their characters
+            HuiGSync.Register("cape", function(player)
+                return buildCape(player, false)
+            end)
             CapeBox:AddToggle("HuiGCape", {
                 Text = "Cape",
                 Default = false,
-                Tooltip = "Cloth cape with your logo and flowing neon rim (only you see it)",
+                Tooltip = "Cloth cape with your logo and flowing neon rim (other HuiG users see it too)",
                 Callback = function(enabled)
                     if enabled then capeStart() else capeStop() end
                 end,
