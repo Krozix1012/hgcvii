@@ -53433,7 +53433,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 		end
 	end
 
-	-- HuiG Sync: players running HuiG see each other's car and cape. Clients can't message each other, but an
+	-- HuiG Sync: players running HuiG see each other's car, jet and cape. Clients can't message each other, but an
 	-- animation played on your own character replicates to everyone, so an effect that's on plays an invisible
 	-- marker animation (weight ~0) whose speed is the effect's code. Every HuiG client watches the other players
 	-- for those markers and builds the effect on their character locally. Kept on tbl12 rather than a local: the
@@ -53443,36 +53443,39 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 		tbl12.HuiGSync = HuiGSync
 		local Players = game:GetService("Players")
 		local MARKER_ID = "182393478" -- stock R6 "toolnone" animation: every client can load it
-		local CODES = { car = 0.031, cape = 0.047 }
+		-- codes 0.016 apart, matched within 0.004. "drift" has no builder: the car copies read it with Has()
+		local CODES = { car = 0.031, cape = 0.047, jet = 0.063, drift = 0.079, car2 = 0.095, car3 = 0.111, car4 = 0.127 }
 		local builders = {} -- name -> function(player) -> stop function
-		local wanted, mine = {}, {} -- our own effects that are on, and their marker tracks
+		local wanted, mine = {}, {} -- our own effects that are on, and their marker { track, animator }
 		local shown = {} -- other player -> name -> stop function (or true while building)
+		local seen = {} -- other player -> name -> true, from the last scan
 
 		local function animatorOf(character)
 			local hum = character and character:FindFirstChildOfClass("Humanoid")
 			return hum and hum:FindFirstChildOfClass("Animator")
 		end
 
+		-- one track per effect, reused while the character lives (the drift marker flips on and off a lot)
 		local function playMarker(name)
-			local old = mine[name]
-			if old then
-				pcall(function()
-					old:Stop(0)
-				end)
-				mine[name] = nil
-			end
 			local animator = animatorOf(Players.LocalPlayer.Character)
 			if not animator then
 				return
 			end
-			local anim = Instance.new("Animation")
-			anim.AnimationId = "rbxassetid://" .. MARKER_ID
-			pcall(function()
-				local track = animator:LoadAnimation(anim)
+			local m = mine[name]
+			if not (m and m.animator == animator) then
+				local anim = Instance.new("Animation")
+				anim.AnimationId = "rbxassetid://" .. MARKER_ID
+				local ok, track = pcall(animator.LoadAnimation, animator, anim)
+				if not ok then
+					return
+				end
 				track.Priority = Enum.AnimationPriority.Core
 				track.Looped = true
-				track:Play(0, 0.001, CODES[name])
-				mine[name] = track
+				m = { track = track, animator = animator }
+				mine[name] = m
+			end
+			pcall(function()
+				m.track:Play(0, 0.001, CODES[name])
 			end)
 		end
 
@@ -53480,16 +53483,28 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 			builders[name] = build
 		end
 
+		-- cheap enough to call every frame: it only starts or stops the marker when that changes
 		function HuiGSync.SetLocal(name, on)
-			wanted[name] = on or nil
+			local m = mine[name]
 			if on then
-				playMarker(name)
-			elseif mine[name] then
-				pcall(function()
-					mine[name]:Stop(0)
-				end)
-				mine[name] = nil
+				wanted[name] = true
+				if not (m and m.track.IsPlaying) then
+					playMarker(name)
+				end
+			else
+				wanted[name] = nil
+				if m and m.track.IsPlaying then
+					pcall(function()
+						m.track:Stop(0)
+					end)
+				end
 			end
+		end
+
+		-- whether another player's marker for `name` was playing at the last scan
+		function HuiGSync.Has(player, name)
+			local list = seen[player]
+			return list ~= nil and list[name] == true
 		end
 
 		local function drop(list, name)
@@ -53504,8 +53519,8 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 			while not flag11 do
 				-- our markers die with the character: put them back after a respawn
 				for name in pairs(wanted) do
-					local track = mine[name]
-					if not (track and track.IsPlaying) then
+					local m = mine[name]
+					if not (m and m.track.IsPlaying) then
 						playMarker(name)
 					end
 				end
@@ -53525,6 +53540,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 								end
 							end
 						end
+						seen[player] = found
 						local list = shown[player] or {}
 						shown[player] = list
 						for name, build in pairs(builders) do
@@ -53551,9 +53567,10 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 							drop(list, name)
 						end
 						shown[player] = nil
+						seen[player] = nil
 					end
 				end
-				task.wait(0.5)
+				task.wait(0.25)
 			end
 			-- unloaded
 			for _, list in pairs(shown) do
@@ -53562,6 +53579,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				end
 			end
 			table.clear(shown)
+			table.clear(seen)
 			for name in pairs(mine) do
 				HuiGSync.SetLocal(name, false)
 			end
@@ -53572,16 +53590,42 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 		local Fun = tbl15.Fun
 		local HuiGSync = tbl12.HuiGSync
 		if Fun then
+			-- own function: Main is at Luau's 200-local limit
+			(function()
 			local Players = game:GetService("Players")
 			local RunService = game:GetService("RunService")
 			local UserInputService = game:GetService("UserInputService")
 			local localPlayer = Players.LocalPlayer
 
 			local BUILDINGS = {
-				-- pivot = where the map's pivot is placed (its own rotation is kept); spawn = teleport spot, nil = the pivot
+				-- pivot = where the map's pivot is placed (its own rotation is kept); spawn = teleport spot, nil = the pivot.
+				-- here = placed under you instead (the baseplate is built from parts, Custom loads the typed asset IDs)
 				["Tokyo City"] = { id = 18194095831, pivot = Vector3.new(-5766, 322, 8323), spawn = nil },
+				-- 1487 x 1400 flat track; spawn is on the long straight (measured from the model: 224 W, 85 S of the pivot)
+				["Race Track"] = { id = 4465387497, pivot = Vector3.new(5800, 320, -8300), spawn = Vector3.new(5576, 321, -8215) },
+				Baseplate = { here = true },
+				Custom = { here = true },
 			}
-			local VEHICLES = { Car = { ["Koenigsegg Jesko Attack"] = 6810376207 } }
+			local BUILDING_ORDER = { "Tokyo City", "Race Track", "Baseplate", "Custom" }
+			local JET_ASSET = 18152799439 -- the F-22 the jet code flies
+			local VEHICLES = {
+				Car = {
+					["Koenigsegg Jesko Attack"] = 6810376207,
+					["a-CAR"] = 2810302648,
+					["Ferrari Hyper Car"] = 17721317046,
+					["Dodge Challenger SRT Hellcat"] = 17452916832,
+				},
+				Jet = { ["F22 Raptor"] = JET_ASSET },
+			}
+			-- HuiG Sync marker per car, so other players build the car you're actually driving
+			local CAR_MARKERS = {
+				["Koenigsegg Jesko Attack"] = "car",
+				["a-CAR"] = "car2",
+				["Ferrari Hyper Car"] = "car3",
+				["Dodge Challenger SRT Hellcat"] = "car4",
+			}
+			-- cars that keep the Valkyrie V12 sample set instead of their own A-Chassis engine sound
+			local VALKYRIE_SOUND = { ["Koenigsegg Jesko Attack"] = true }
 
 			local function val(idx, default)
 				local o = options[idx] or toggles[idx]
@@ -53616,9 +53660,11 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				return keys
 			end
 
-			-- Visual Buildings: each map is pinned to a fixed pivot position; the sliders offset it from there
-			local buildingModel, buildingPivot, buildingName, buildingToken = nil, nil, nil, 0
+			-- Visual Buildings: a map is placed once (at its fixed pivot, or under you for the "here" ones) and the
+			-- sliders offset it from there
+			local buildingModel, buildingPivot, buildingSpawn, buildingToken = nil, nil, nil, 0
 			local buildingSounds = {}
+			local TILE = 2048 -- Roblox's largest part size: a bigger baseplate is a grid of tiles
 
 			local function buildingOffset()
 				return Vector3.new(val("FunBuildingX", 0), val("FunBuildingY", 0), val("FunBuildingZ", 0))
@@ -53630,6 +53676,82 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				end
 			end
 
+			-- (re)builds the baseplate's tiles; its pivot is the top centre, so resizing keeps the floor where it is
+			local function buildBaseplate()
+				local model = buildingModel
+				if not (model and model.Name == "HuiGBaseplate") then
+					return
+				end
+				model:ClearAllChildren()
+				local at = buildingPivot + buildingOffset()
+				local sx, sz, t = val("FunBaseplateX", 2048), val("FunBaseplateZ", 2048), val("FunBaseplateThick", 16)
+				local nx, nz = math.ceil(sx / TILE), math.ceil(sz / TILE)
+				local tx, tz = sx / nx, sz / nz
+				for i = 1, nx do
+					for j = 1, nz do
+						local tile = Instance.new("Part")
+						tile.Name = "Baseplate"
+						tile.Anchored = true
+						tile.Size = Vector3.new(tx, t, tz)
+						tile.CFrame = at * CFrame.new((i - 0.5) * tx - sx / 2, -t / 2, (j - 0.5) * tz - sz / 2)
+						tile.Color = Color3.fromRGB(91, 91, 91)
+						tile.Material = Enum.Material.Plastic
+						tile.TopSurface = Enum.SurfaceType.Smooth
+						tile.BottomSurface = Enum.SurfaceType.Smooth
+						local grid = Instance.new("Texture") -- the stud grid of Roblox's own Baseplate
+						grid.Texture = "rbxassetid://6372755229"
+						grid.Face = Enum.NormalId.Top
+						grid.StudsPerTileU, grid.StudsPerTileV = 8, 8
+						grid.Color3 = Color3.new(0, 0, 0)
+						grid.Transparency = 0.8
+						grid.Parent = tile
+						tile.Parent = model
+					end
+				end
+				model.WorldPivot = at
+			end
+
+			-- sliders fire on every drag step; rebuilding up to ~2400 tiles each time would stutter
+			local baseplateQueued = false
+			local function queueBaseplate()
+				if not baseplateQueued then
+					baseplateQueued = true
+					task.delay(0.2, function()
+						baseplateQueued = false
+						buildBaseplate()
+					end)
+				end
+			end
+
+			-- every asset ID typed in (any run of 4+ digits, so pasted links work too), loaded into one model
+			local function loadCustom()
+				local model = Instance.new("Model")
+				model.Name = "HuiGCustomBuilding"
+				for id in tostring(val("FunBuildingAssets", "")):gmatch("%d%d%d%d+") do
+					local ok, objects = pcall(function()
+						return game:GetObjects("rbxassetid://" .. id)
+					end)
+					if ok and objects and #objects > 0 then
+						for _, o in ipairs(objects) do
+							o.Parent = model
+						end
+					else
+						notify("Couldn't load asset " .. id)
+					end
+				end
+				-- anyone's assets can be typed in here: none of their scripts may run
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("LuaSourceContainer") then
+						d:Destroy()
+					end
+				end
+				if #model:GetChildren() == 0 then
+					model:Destroy()
+					return nil
+				end
+				return model
+			end
+
 			local function teleportToBuilding()
 				local root = getRoot()
 				if not (buildingModel and root) then
@@ -53637,8 +53759,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					return
 				end
 				root.AssemblyLinearVelocity = Vector3.zero
-				local info = BUILDINGS[buildingName]
-				root.CFrame = CFrame.new((info.spawn or info.pivot + Vector3.new(0, 5, 0)) + buildingOffset())
+				root.CFrame = CFrame.new(buildingSpawn + buildingOffset())
 			end
 
 			local function applyBuildingVolume()
@@ -53661,7 +53782,24 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				removeBuilding()
 				local token = buildingToken
 				local name = val("FunBuilding", "Tokyo City")
-				local model = BUILDINGS[name] and loadAsset(BUILDINGS[name].id)
+				local info = BUILDINGS[name]
+				local root, humanoid = getRoot()
+				if not info then
+					return
+				end
+				if info.here and not (root and humanoid) then
+					notify("Spawn your character first.")
+					return
+				end
+				local model
+				if name == "Baseplate" then
+					model = Instance.new("Model")
+					model.Name = "HuiGBaseplate"
+				elseif name == "Custom" then
+					model = loadCustom()
+				else
+					model = loadAsset(info.id)
+				end
 				if token ~= buildingToken then
 					-- toggled off or switched while GetObjects was yielding
 					if model then
@@ -53670,7 +53808,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					return
 				end
 				if not model then
-					notify("Couldn't load " .. tostring(name))
+					notify(name == "Custom" and "Type the asset IDs to load first." or "Couldn't load " .. tostring(name))
 					return
 				end
 
@@ -53686,8 +53824,25 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					end
 				end
 
-				buildingPivot = model:GetPivot().Rotation + BUILDINGS[name].pivot
-				buildingModel, buildingName = model, name
+				buildingModel = model
+				if info.here then
+					-- under your feet: R6 hips sit a fixed 3 studs up, R15 ones at HipHeight
+					local drop = humanoid.RigType == Enum.HumanoidRigType.R15 and humanoid.HipHeight + root.Size.Y / 2 or 3
+					local feet = root.Position - Vector3.new(0, drop, 0)
+					buildingSpawn = feet + Vector3.new(0, drop + 0.5, 0)
+					if name == "Baseplate" then
+						buildingPivot = CFrame.new(feet)
+						buildBaseplate()
+					else
+						-- the assets' bottom centre goes under your feet
+						local ok, box, size = pcall(model.GetBoundingBox, model)
+						local bottom = ok and (box * CFrame.new(0, -size.Y / 2, 0)).Position or feet
+						buildingPivot = model:GetPivot() + (feet - bottom)
+					end
+				else
+					buildingPivot = model:GetPivot().Rotation + info.pivot
+					buildingSpawn = info.spawn or info.pivot + Vector3.new(0, 5, 0)
+				end
 				placeBuilding()
 				applyBuildingVolume()
 				model.Parent = workspace
@@ -53704,18 +53859,20 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 						sound:Play()
 					end
 				end
-				teleportToBuilding()
+				if not info.here then
+					teleportToBuilding()
+				end
 			end
 
 			local Buildings = Fun:AddLeftGroupbox("<b>Visual Buildings</b>", "building")
 
 			Buildings:AddDropdown("FunBuilding", {
 				Text = "Building",
-				Values = sortedKeys(BUILDINGS),
+				Values = BUILDING_ORDER,
 				Default = 1,
 				AllowNull = false,
 				Multi = false,
-				ValueImages = { ["Tokyo City"] = "building" },
+				ValueImages = { ["Tokyo City"] = "building", ["Race Track"] = "flag", Baseplate = "square", Custom = "package" },
 				Callback = function()
 					if val("FunBuildingEnabled", false) then
 						task.spawn(spawnBuilding)
@@ -53723,12 +53880,63 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				end,
 			})
 
-			Buildings:AddLabel("<b>Night shader is recommended.</b>")
-			Buildings:AddDivider("Preview")
-			Buildings:AddImage("FunBuildingPreview", {
+			-- each building's own extras, shown only while it's selected
+			local TokyoBox = Buildings:AddDependencyBox()
+			TokyoBox:SetupDependencies({ { options.FunBuilding, "Tokyo City" } })
+			TokyoBox:AddLabel("<b>Night shader is recommended.</b>")
+			TokyoBox:AddDivider("Preview")
+			TokyoBox:AddImage("FunBuildingPreview", {
 				Image = "rbxthumb://type=Asset&id=" .. BUILDINGS["Tokyo City"].id .. "&w=420&h=420",
 				Height = 140,
 			})
+
+			local TrackBox = Buildings:AddDependencyBox()
+			TrackBox:SetupDependencies({ { options.FunBuilding, "Race Track" } })
+			TrackBox:AddLabel("<b>Spawn the car from the Vehicle Garage to race on it.</b>", true)
+			TrackBox:AddDivider("Preview")
+			TrackBox:AddImage("FunTrackPreview", {
+				Image = "rbxthumb://type=Asset&id=" .. BUILDINGS["Race Track"].id .. "&w=420&h=420",
+				Height = 140,
+			})
+
+			local BaseplateBox = Buildings:AddDependencyBox()
+			BaseplateBox:SetupDependencies({ { options.FunBuilding, "Baseplate" } })
+			for _, s in ipairs({
+				{ "FunBaseplateX", "Width", 2048, 16, 100000 },
+				{ "FunBaseplateZ", "Length", 2048, 16, 100000 },
+				{ "FunBaseplateThick", "Thickness", 16, 1, 500 },
+			}) do
+				BaseplateBox:AddSlider(s[1], {
+					Text = s[2],
+					Default = s[3],
+					Min = s[4],
+					Max = s[5],
+					Rounding = 0,
+					Suffix = " studs",
+					Compact = true,
+					Callback = queueBaseplate,
+				})
+			end
+
+			local CustomBox = Buildings:AddDependencyBox()
+			CustomBox:SetupDependencies({ { options.FunBuilding, "Custom" } })
+			CustomBox:AddInput("FunBuildingAssets", {
+				Text = "Asset IDs",
+				Placeholder = "e.g. 4465387497, 123456",
+				Finished = true,
+				ClearTextOnFocus = false,
+				Tooltip = "Model asset IDs or links, separated by commas or spaces. Loaded together and placed under you.",
+				Callback = function(text)
+					local first = tostring(text):match("%d%d%d%d+")
+					pcall(function()
+						options.FunCustomPreview:SetImage(first and "rbxthumb://type=Asset&id=" .. first .. "&w=420&h=420" or "package")
+					end)
+					if val("FunBuildingEnabled", false) and val("FunBuilding", "") == "Custom" then
+						task.spawn(spawnBuilding)
+					end
+				end,
+			})
+			CustomBox:AddImage("FunCustomPreview", { Image = "package", Height = 140 })
 
 			Buildings:AddToggle("FunBuildingEnabled", {
 				Text = "Enable Building",
@@ -53773,7 +53981,6 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					Callback = placeBuilding,
 				})
 			end
-
 			-- Vehicle Garage: you sit in the car's own seat and the whole car is moved by CFrame every frame (no
 			-- forces that could launch it). Handling is a bicycle model: engine/brake/drag along the heading,
 			-- speed-sensitive steering, and tyre grip that bleeds off the sideways slide. Each wheel probes its own
@@ -53872,13 +54079,37 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				return keys
 			end
 
+			-- The jet is flown by the jet code (Peak Visuals block, which exposes _JET.spawn/unmount); the garage starts
+			-- and ends it and keeps its Spawn toggle in step when you get in or out some other way (keybind, jump, death)
+			local jetBusy, jetToggleSync = false, false
+			local function unmountJet()
+				if _JET and _JET.mounted and _JET.unmount then
+					jetBusy = true
+					_JET.unmount()
+					jetBusy = false
+				end
+			end
+			tbl12.OnJetMounted = function(on)
+				HuiGSync.SetLocal("jet", on)
+				local t = toggles.FunVehicleSpawn
+				if not jetBusy and t and t.Value ~= on and val("FunVehicleType", "Car") == "Jet" then
+					jetToggleSync = true
+					t:SetValue(on)
+					jetToggleSync = false
+				end
+			end
+
 			local function despawnVehicle()
+				unmountJet()
 				if not car then
 					return
 				end
 				local c = car
 				car = nil
-				HuiGSync.SetLocal("car", false)
+				for _, marker in pairs(CAR_MARKERS) do
+					HuiGSync.SetLocal(marker, false)
+				end
+				HuiGSync.SetLocal("drift", false)
 				c.conn:Disconnect()
 				if c.sitTrack then
 					c.sitTrack:Stop()
@@ -53964,10 +54195,17 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				return h
 			end
 
-			local function makeSmoke(knuckle, radius)
+			-- tyre smoke under a wheel: the car's own smoke emitter when it brought one (`template`), else a plain white one
+			local function makeSmoke(knuckle, radius, template)
 				local attachment = Instance.new("Attachment")
 				attachment.Position = Vector3.new(0, -radius, 0)
 				attachment.Parent = knuckle
+				if template then
+					local own = template:Clone()
+					own.Enabled = false
+					own.Parent = attachment
+					return own
+				end
 				local smoke = Instance.new("ParticleEmitter")
 				smoke.Texture = "rbxasset://textures/particles/smoke_main.dds"
 				smoke.Color = ColorSequence.new(Color3.fromRGB(225, 225, 225))
@@ -53985,6 +54223,207 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				smoke.Enabled = false
 				smoke.Parent = attachment
 				return smoke
+			end
+
+			-- a wheel's hub (its biggest visible part) in `frameCF` space, and its radius
+			local function wheelHub(g, frameCF)
+				local main, best = nil, -1
+				for _, p in ipairs(g.parts) do
+					local volume = p.Size.X * p.Size.Y * p.Size.Z
+					if p.Transparency < 1 and volume > best then
+						main, best = p, volume
+					end
+				end
+				main = main or g.parts[1]
+				return frameCF:PointToObjectSpace(main.Position), math.clamp(math.max(main.Size.X, main.Size.Y, main.Size.Z) / 2, 0.8, 4)
+			end
+
+			-- What an A-Chassis car brings along: its engine sample and pitch range (the Rev sound's SetPitch/SetRev, which
+			-- its sound plugin uses as pitch = SetPitch + SetRev * rpm / redline), a supercharger whine and blow-off valve,
+			-- and its tyre-smoke emitter. Read before carFrame strips the plugin scripts these live under.
+			local function carProfile(model)
+				local profile = {}
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("Sound") and d.SoundId ~= "" then
+						local setRev, setPitch = d:FindFirstChild("SetRev"), d:FindFirstChild("SetPitch")
+						if d.Name == "Rev" and setRev and not profile.rev then
+							profile.rev = { id = d.SoundId, pitch = setPitch and setPitch.Value or 0.1, span = setRev.Value }
+						elseif d.Name == "Whine" and d.Parent.Name:find("Boost") then
+							profile.whine = d.SoundId
+						elseif d.Name == "BOV" then
+							profile.bov = d.SoundId
+						end
+					elseif d:IsA("ParticleEmitter") and d.Name == "Smoke" and d.Parent.Name == "Smoke_FE" and not profile.smoke then
+						profile.smoke = d:Clone()
+					end
+				end
+				return profile
+			end
+
+			-- The car's own exhaust backfire (flames, flash and pops when you lift off at high revs) and brake/reverse
+			-- lights, found by their A-Chassis names. Returns update(dt, revs 0-1, throttle, braking, reversing, soundOn).
+			local function makeCarFx(model)
+				local fire, flash, pops, brake, reverse = {}, {}, {}, {}, {}
+				local top = #model:GetFullName() + 1
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("ParticleEmitter") or d:IsA("Light") or d:IsA("Sound") then
+						local path = d:GetFullName():sub(top):lower()
+						if path:find("backfire") or path:find("bflight") or path:find("bf_light") or path:find("%.bf%d") then
+							if d:IsA("ParticleEmitter") then
+								d.Enabled = false
+								table.insert(fire, d)
+							elseif d:IsA("Light") then
+								d.Enabled = false
+								table.insert(flash, d)
+							else
+								d.Volume = math.min(d.Volume, 1.5)
+								table.insert(pops, d)
+							end
+						elseif d:IsA("Light") and path:find("brake") then
+							table.insert(brake, d)
+						elseif d:IsA("Light") and path:find("reverse") then
+							table.insert(reverse, d)
+						end
+					end
+				end
+				local lastThrottle, cooldown, flashLeft = 0, 0, 0
+				return function(dt, revs, throttle, braking, reversing, soundOn)
+					for _, l in ipairs(brake) do
+						l.Enabled = braking
+					end
+					for _, l in ipairs(reverse) do
+						l.Enabled = reversing
+					end
+					cooldown -= dt
+					flashLeft -= dt
+					if lastThrottle > 0 and throttle <= 0 and revs > 0.55 and cooldown <= 0 and #fire + #pops > 0 then
+						cooldown, flashLeft = 0.6, 0.15
+						local pop = pops[math.random(math.max(#pops, 1))]
+						if pop and soundOn then
+							pop:Play()
+						end
+					end
+					lastThrottle = throttle
+					local lit = flashLeft > 0
+					for _, e in ipairs(fire) do
+						e.Enabled = lit
+					end
+					for _, l in ipairs(flash) do
+						l.Enabled = lit
+					end
+				end
+			end
+
+			-- Engine and tyre sounds on `parent` (3D, and gone with it). With a car's `profile.rev` it plays that car's own
+			-- engine sample (plus its supercharger whine and blow-off valve); otherwise an Aston Martin Valkyrie V12 sample
+			-- set, where like racing games the two samples either side of the RPM are crossfaded and pitched. Returns
+			-- update(dt, forward, throttle, grounded, drifting, scrub, enabled) -> revs 0-1. Your car and other HuiG
+			-- players' use it.
+			local function makeEngineSound(parent, profile)
+				local function carSound(id, looped)
+					local sound = Instance.new("Sound")
+					sound.SoundId = id
+					sound.Looped = looped ~= false
+					sound.Volume = 0
+					sound.RollOffMaxDistance = 250
+					sound.Parent = parent
+					return sound
+				end
+				local function bank(list)
+					local out = {}
+					for _, entry in ipairs(list) do
+						local sound = carSound("rbxassetid://" .. entry[2])
+						sound:Play()
+						table.insert(out, { rpm = entry[1], sound = sound })
+					end
+					return out
+				end
+				local own = profile and profile.rev
+				local onBank, offBank, idleSound, revSound, whine, bov
+				if own then
+					revSound = carSound(own.id)
+					revSound:Play()
+					whine = profile.whine and carSound(profile.whine)
+					if whine then
+						whine:Play()
+					end
+					bov = profile.bov and carSound(profile.bov, false)
+				else
+					onBank, offBank = bank(ENGINE_ON), bank(ENGINE_OFF)
+					idleSound = carSound("rbxassetid://" .. ENGINE_IDLE[2])
+					idleSound:Play()
+				end
+				local skidSound = carSound(SKID_SOUND)
+				local rpm, revLoad = IDLE_RPM, 0
+
+				-- gives the two samples either side of the current RPM their share of `volume`, pitched to match
+				local function mixBank(list, volume)
+					for _, entry in ipairs(list) do
+						entry.sound.Volume = 0
+					end
+					local below, above, t = list[1], list[1], 0
+					if rpm >= list[#list].rpm then
+						below, above = list[#list], list[#list]
+					else
+						for i = 1, #list - 1 do
+							if rpm >= list[i].rpm and rpm < list[i + 1].rpm then
+								below, above = list[i], list[i + 1]
+								t = (rpm - below.rpm) / (above.rpm - below.rpm)
+								break
+							end
+						end
+					end
+					below.sound.Volume = volume * (1 - t)
+					above.sound.Volume += volume * t
+					below.sound.PlaybackSpeed = math.clamp(rpm / below.rpm, 0.5, 2)
+					above.sound.PlaybackSpeed = math.clamp(rpm / above.rpm, 0.5, 2)
+				end
+
+				return function(dt, forward, throttle, grounded, drifting, scrub, enabled)
+					-- RPM from a 6-speed box: first gear revs from idle, later gears pick up after the shift drop
+					local ratio = math.clamp(math.abs(forward) / TOP_SPEED, 0, 1)
+					local gear = math.min(GEARS, math.floor(ratio * GEARS) + 1)
+					local inGear = ratio * GEARS - (gear - 1)
+					local gearFloor = gear == 1 and IDLE_RPM or SHIFT_RPM
+					local wantRpm = gearFloor + inGear * (REDLINE - gearFloor)
+					if throttle ~= 0 and (not grounded or drifting or math.abs(forward) < 3) then
+						-- free-revving: in the air, spinning the rears in a drift, or launching from a stop
+						wantRpm = math.max(wantRpm, REDLINE * (drifting and 0.85 or 0.75))
+					end
+					rpm += (wantRpm - rpm) * math.min(1, 9 * dt)
+					local master = enabled and 0.6 or 0
+					local revs = rpm / REDLINE
+					if own then
+						revSound.PlaybackSpeed = own.pitch + own.span * revs
+						revSound.Volume = master * (0.55 + 0.45 * revLoad)
+						if whine then
+							whine.PlaybackSpeed = 0.5 + 1.5 * revs
+							whine.Volume = master * 0.3 * revLoad * revs
+						end
+						-- the blow-off valve vents when you lift off a boosted engine
+						if bov and enabled and throttle <= 0 and revLoad > 0.8 and revs > 0.45 and not bov.IsPlaying then
+							bov.Volume = 0.6
+							bov:Play()
+						end
+					else
+						local idleShare = math.clamp((ENGINE_ON[1][1] - rpm) / (ENGINE_ON[1][1] - IDLE_RPM), 0, 1)
+						mixBank(onBank, master * revLoad * (1 - idleShare))
+						mixBank(offBank, master * (1 - revLoad) * (1 - idleShare))
+						idleSound.Volume = master * idleShare
+						idleSound.PlaybackSpeed = math.clamp(rpm / ENGINE_IDLE[1], 0.5, 2)
+					end
+					-- tyres squeal with `scrub`: the sideways slide, or a locked rear wheel dragging
+					local wantSkid = enabled and math.clamp((scrub - 6) / 25, 0, 1) * 0.7 or 0
+					skidSound.Volume += (wantSkid - skidSound.Volume) * math.min(1, 10 * dt)
+					skidSound.PlaybackSpeed = 0.9 + math.clamp(scrub / 60, 0, 0.25)
+					if skidSound.Volume > 0.01 and not skidSound.IsPlaying then
+						skidSound:Play()
+					elseif skidSound.Volume <= 0.01 and skidSound.IsPlaying then
+						skidSound:Stop()
+					end
+					revLoad += ((throttle > 0 and 1 or 0) - revLoad) * math.min(1, 10 * dt)
+					return revs
+				end
 			end
 
 			-- strip the chassis physics (suspension, motors, thrusters, scripts) and work out the driver frame: the seat
@@ -54012,50 +54451,189 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				return seat, frame
 			end
 
-			-- Other HuiG players' cars (HuiG Sync): the same model, anchored and posed from their body every frame.
-			-- The driver is always welded at a fixed offset above the driver point, so the body alone places the car.
-			local remoteCarTemplate = nil
-			HuiGSync.Register("car", function(player)
-				if not remoteCarTemplate then
-					remoteCarTemplate = loadAsset(VEHICLES.Car["Koenigsegg Jesko Attack"])
+			-- Other HuiG players' cars (HuiG Sync): the car they picked, anchored and posed from their body every frame (the
+			-- driver is welded at a fixed offset above the driver point, so the body alone places the car). Its engine,
+			-- backfire and lights run from how fast the body moves; their drift marker lights the rear tyre smoke.
+			local remoteCarTemplates = {}
+			for carName, marker in pairs(CAR_MARKERS) do
+				HuiGSync.Register(marker, function(player)
+					if not remoteCarTemplates[carName] then
+						remoteCarTemplates[carName] = loadAsset(VEHICLES.Car[carName])
+					end
+					if not remoteCarTemplates[carName] then
+						return nil
+					end
+					local model = remoteCarTemplates[carName]:Clone()
+					local profile = carProfile(model)
+					local _, frame = carFrame(model)
+					local smokes = {}
+					for _, g in ipairs(findWheelGroups(model, frame)) do
+						local localPos, radius = wheelHub(g, frame)
+						if localPos.Z >= 0 then
+							table.insert(smokes, makeSmoke(makeHolder("HuiGSmoke", frame * CFrame.new(localPos), model), radius, profile.smoke))
+						end
+					end
+					local speaker = makeHolder("HuiGEngine", frame, model)
+					for _, d in ipairs(model:GetDescendants()) do
+						if d:IsA("BasePart") then
+							d.Anchored = true
+							d.CanCollide = false
+							d.CanQuery = false
+							d.CanTouch = false
+						elseif d:IsA("Seat") or d:IsA("VehicleSeat") then
+							d.Disabled = true
+						end
+					end
+					local engineSound = makeEngineSound(speaker, not VALKYRIE_SOUND[carName] and profile or nil)
+					local carFx = makeCarFx(model)
+					local toPivot = frame:ToObjectSpace(model:GetPivot())
+					local driverToCar = CFrame.new(0, -(SEAT_DROP - DRIVER_LOWER), 0)
+					model.Name = "HuiGRemoteCar"
+					model.Parent = workspace
+					local lastPos, vel, lastForward, accel = nil, Vector3.zero, 0, 0
+					local conn = RunService.RenderStepped:Connect(function(dt)
+						local character = player.Character
+						local hrp = character and character:FindFirstChild("HumanoidRootPart")
+						if not hrp or dt <= 0 then
+							return
+						end
+						local cf = hrp.CFrame
+						model:PivotTo(cf * driverToCar * toPivot)
+						-- their speed, smoothed: replicated positions arrive unevenly
+						if lastPos then
+							vel += ((cf.Position - lastPos) / dt - vel) * math.min(1, 6 * dt)
+						end
+						lastPos = cf.Position
+						local forward = vel:Dot(cf.LookVector)
+						local slide = (vel - cf.LookVector * forward).Magnitude
+						accel += ((forward - lastForward) / dt - accel) * math.min(1, 6 * dt)
+						lastForward = forward
+						local drifting = HuiGSync.Has(player, "drift")
+						local smokeOn = drifting and val("FunCarSmoke", true)
+						for _, smoke in ipairs(smokes) do
+							smoke.Enabled = smokeOn
+							smoke.Rate = 30 + slide * 4
+						end
+						local scrub = drifting and math.max(slide, math.abs(forward)) or slide
+						local soundOn = val("FunCarSounds", true)
+						local throttle = accel > 1 and 1 or 0
+						local revs = engineSound(dt, forward, throttle, true, drifting, scrub, soundOn)
+						carFx(dt, revs, throttle, accel < -15 and forward > 1, forward < -1, soundOn)
+					end)
+					return function()
+						conn:Disconnect()
+						model:Destroy()
+					end
+				end)
+			end
+			-- Other HuiG players' jets: the F-22 anchored where their jet sits (welded 5 below and 10 behind their body),
+			-- their character hidden inside it like your own is, and the engine sounds from how fast they fly
+			local remoteJetTemplate = nil
+			HuiGSync.Register("jet", function(player)
+				if not remoteJetTemplate then
+					remoteJetTemplate = loadAsset(JET_ASSET)
 				end
-				if not remoteCarTemplate then
+				if not remoteJetTemplate then
 					return nil
 				end
-				local model = remoteCarTemplate:Clone()
-				local _, frame = carFrame(model)
+				local model = remoteJetTemplate:Clone()
+				model.Name = "HuiGRemoteJet" -- not the asset's own name: the jet code deletes that one by name
+				local misc = model:FindFirstChild("Misc")
+				local gear = misc and misc:FindFirstChild("LandingGear")
+				if gear then
+					gear:Destroy()
+				end
+				local speaker = makeHolder("HuiGJetSound", model:GetPivot(), model)
 				for _, d in ipairs(model:GetDescendants()) do
 					if d:IsA("BasePart") then
 						d.Anchored = true
 						d.CanCollide = false
 						d.CanQuery = false
 						d.CanTouch = false
-					elseif d:IsA("Seat") or d:IsA("VehicleSeat") then
-						d.Disabled = true
+					elseif d:IsA("LuaSourceContainer") then
+						d:Destroy()
 					end
 				end
-				local toPivot = frame:ToObjectSpace(model:GetPivot())
-				local driverToCar = CFrame.new(0, -(SEAT_DROP - DRIVER_LOWER), 0)
-				model.Name = "HuiGRemoteCar"
+				local function jetSound(id)
+					local sound = Instance.new("Sound")
+					sound.SoundId = id
+					sound.Looped = true
+					sound.Volume = 0
+					sound.RollOffMaxDistance = 600
+					sound.Parent = speaker
+					sound:Play()
+					return sound
+				end
+				-- the jet code's flying and boost sounds
+				local fly, boost = jetSound("rbxassetid://95345594297694"), jetSound("rbxassetid://96899873315260")
 				model.Parent = workspace
-				local conn = RunService.RenderStepped:Connect(function()
+				local hidden = {}
+				local lastPos, vel = nil, Vector3.zero
+				local conn = RunService.RenderStepped:Connect(function(dt)
 					local character = player.Character
 					local hrp = character and character:FindFirstChild("HumanoidRootPart")
-					if hrp then
-						model:PivotTo(hrp.CFrame * driverToCar * toPivot)
+					if not hrp or dt <= 0 then
+						return
 					end
+					model:PivotTo(hrp.CFrame * CFrame.new(0, -5, 10))
+					for _, d in ipairs(character:GetDescendants()) do
+						if d:IsA("BasePart") and d.LocalTransparencyModifier < 1 then
+							hidden[d] = true
+							d.LocalTransparencyModifier = 1
+						end
+					end
+					if lastPos then
+						vel += ((hrp.Position - lastPos) / dt - vel) * math.min(1, 6 * dt)
+					end
+					lastPos = hrp.Position
+					-- full throttle is 360 studs/s; the boost multiplies it. Volumes follow your own jet sound settings.
+					local settings = _JET or {}
+					local speed = vel.Magnitude
+					local throttle = math.clamp(speed / 360, 0, 1)
+					local flyVol = settings.flyingSoundOn ~= false and throttle * (settings.flyingVolMax or 0.7) or 0
+					local boostVol = (settings.boostSoundOn ~= false and speed > 420) and (settings.boostVolMax or 0.7) or 0
+					fly.Volume += (flyVol - fly.Volume) * math.min(1, 2.8 * dt)
+					fly.PlaybackSpeed = 0.6 + throttle * 0.8
+					boost.Volume += (boostVol - boost.Volume) * math.min(1, 2.8 * dt)
+					boost.PlaybackSpeed = 0.8 + math.clamp(speed / 300, 0, 1) * 0.7
 				end)
 				return function()
 					conn:Disconnect()
 					model:Destroy()
+					for part in pairs(hidden) do
+						if part.Parent then
+							part.LocalTransparencyModifier = 0
+						end
+					end
 				end
 			end)
-
 			local vehicleToken = 0
 			local function spawnVehicle()
 				despawnVehicle()
 				vehicleToken += 1
 				local token = vehicleToken
+				if val("FunVehicleType", "Car") == "Jet" then
+					if not (_JET and _JET.spawn) then
+						notify("The jet isn't loaded.")
+						stopVehicle()
+						return
+					end
+					-- switching the type fires this twice in one frame (the list changes, then the pick): only the last spawns
+					task.wait()
+					if token ~= vehicleToken then
+						return
+					end
+					jetBusy = true
+					_JET.spawn() -- loads the F-22 and gets in; yields
+					jetBusy = false
+					if token ~= vehicleToken or not val("FunVehicleSpawn", false) then
+						unmountJet()
+					elseif not _JET.mounted then
+						notify("Couldn't load the jet")
+						stopVehicle()
+					end
+					return
+				end
 				local root, humanoid, character = getRoot()
 				if not (root and humanoid) then
 					return
@@ -54081,6 +54659,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					end)
 				end
 
+				local profile = carProfile(model)
 				local seat, frame = carFrame(model)
 
 				-- ride height and footprint from visible parts near the driver, so display stands or stray props don't count
@@ -54143,16 +54722,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				-- wheels: knuckle (suspension + steering) -> spinner (rolling), each on a Weld we drive every frame
 				local wheels, holderOf = {}, {}
 				for _, g in ipairs(findWheelGroups(model, carRoot.CFrame)) do
-					local main, best = nil, -1
-					for _, p in ipairs(g.parts) do
-						local volume = p.Size.X * p.Size.Y * p.Size.Z
-						if p.Transparency < 1 and volume > best then
-							main, best = p, volume
-						end
-					end
-					main = main or g.parts[1]
-					local localPos = carRoot.CFrame:PointToObjectSpace(main.Position)
-					local radius = math.clamp(math.max(main.Size.X, main.Size.Y, main.Size.Z) / 2, 0.8, 4)
+					local localPos, radius = wheelHub(g, carRoot.CFrame)
 					local hubCF = carRoot.CFrame * CFrame.new(localPos)
 					local knuckle = makeHolder("HuiGKnuckle", hubCF, carRoot)
 					local spinner = makeHolder("HuiGSpinner", hubCF, carRoot)
@@ -54175,7 +54745,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 						front = front,
 						kWeld = kWeld,
 						sWeld = sWeld,
-						smoke = not front and makeSmoke(knuckle, radius) or nil,
+						smoke = not front and makeSmoke(knuckle, radius, profile.smoke) or nil,
 						spin = 0,
 						susp = 0,
 					})
@@ -54220,53 +54790,8 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 
 				car = { model = model, root = carRoot, seat = seat, humanoid = humanoid, autoRotate = humanoid.AutoRotate }
 
-				-- sounds live on the car so they're 3D and go away with it
-				local function carSound(id, volume)
-					local sound = Instance.new("Sound")
-					sound.SoundId = id
-					sound.Looped = true
-					sound.Volume = volume
-					sound.RollOffMaxDistance = 250
-					sound.Parent = carRoot
-					return sound
-				end
-				local function bank(list)
-					local out = {}
-					for _, entry in ipairs(list) do
-						local sound = carSound("rbxassetid://" .. entry[2], 0)
-						sound:Play()
-						table.insert(out, { rpm = entry[1], sound = sound })
-					end
-					return out
-				end
-				local onBank, offBank = bank(ENGINE_ON), bank(ENGINE_OFF)
-				local idleSound = carSound("rbxassetid://" .. ENGINE_IDLE[2], 0)
-				idleSound:Play()
-				local skidSound = carSound(SKID_SOUND, 0)
-				local rpm, load = IDLE_RPM, 0
-
-				-- gives the two samples either side of the current RPM their share of `volume`, pitched to match
-				local function mixBank(list, volume)
-					for _, entry in ipairs(list) do
-						entry.sound.Volume = 0
-					end
-					local below, above, t = list[1], list[1], 0
-					if rpm >= list[#list].rpm then
-						below, above = list[#list], list[#list]
-					else
-						for i = 1, #list - 1 do
-							if rpm >= list[i].rpm and rpm < list[i + 1].rpm then
-								below, above = list[i], list[i + 1]
-								t = (rpm - below.rpm) / (above.rpm - below.rpm)
-								break
-							end
-						end
-					end
-					below.sound.Volume = volume * (1 - t)
-					above.sound.Volume += volume * t
-					below.sound.PlaybackSpeed = math.clamp(rpm / below.rpm, 0.5, 2)
-					above.sound.PlaybackSpeed = math.clamp(rpm / above.rpm, 0.5, 2)
-				end
+				local engineSound = makeEngineSound(carRoot, not VALKYRIE_SOUND[name] and profile or nil) -- 3D, gone with the car
+				local carFx = makeCarFx(model)
 				humanoid.AutoRotate = false
 				-- Space is the handbrake/drift key while driving, so it must not jump out of the car
 				humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
@@ -54294,6 +54819,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				local chassisPitch, chassisRoll = 0, 0
 				local bodyPitch, bodyPitchV, bodyRoll, bodyRollV, heave, heaveV = 0, 0, 0, 0, 0, 0
 				local seated, welded = false, false
+				local driftHold = 0 -- keeps the drift marker on through short gaps, so other players' smoke doesn't flicker
 
 				local function stepCar(dt)
 					dt = math.min(dt, 1 / 20)
@@ -54324,6 +54850,8 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					local speed = vel.Magnitude
 					local drifting = grounded and val("FunVehicleDrift", false) and handbrake and speed > 12
 					local lastYaw = yaw
+					driftHold = drifting and 0.3 or driftHold - dt
+					HuiGSync.SetLocal("drift", driftHold > 0)
 
 					if grounded then
 						-- engine pulls less as you near top speed; S brakes first, then reverses
@@ -54556,35 +55084,11 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 							w.smoke.Rate = 30 + slide * 4
 						end
 					end
-					-- engine RPM from a 6-speed box: first gear revs from idle, later gears pick up after the shift drop
-					local soundsOn = val("FunCarSounds", true)
-					local ratio = math.clamp(math.abs(forward) / TOP_SPEED, 0, 1)
-					local gear = math.min(GEARS, math.floor(ratio * GEARS) + 1)
-					local inGear = ratio * GEARS - (gear - 1)
-					local gearFloor = gear == 1 and IDLE_RPM or SHIFT_RPM
-					local wantRpm = gearFloor + inGear * (REDLINE - gearFloor)
-					if throttle ~= 0 and (not grounded or drifting or math.abs(forward) < 3) then
-						-- free-revving: in the air, spinning the rears in a drift, or launching from a stop
-						wantRpm = math.max(wantRpm, REDLINE * (drifting and 0.85 or 0.75))
-					end
-					rpm += (wantRpm - rpm) * math.min(1, 9 * dt)
-					load += ((throttle > 0 and 1 or 0) - load) * math.min(1, 10 * dt)
-					local master = soundsOn and 0.6 or 0
-					local idleShare = math.clamp((ENGINE_ON[1][1] - rpm) / (ENGINE_ON[1][1] - IDLE_RPM), 0, 1)
-					mixBank(onBank, master * load * (1 - idleShare))
-					mixBank(offBank, master * (1 - load) * (1 - idleShare))
-					idleSound.Volume = master * idleShare
-					idleSound.PlaybackSpeed = math.clamp(rpm / ENGINE_IDLE[1], 0.5, 2)
-					-- tyres: squeal with the sideways slide, or a locked rear wheel dragging
+					-- tyres: the sideways slide, or a locked rear wheel dragging
 					local scrub = grounded and math.max(slide, (handbrake and math.abs(forward) > 3) and math.abs(forward) or 0) or 0
-					local wantSkid = soundsOn and math.clamp((scrub - 6) / 25, 0, 1) * 0.7 or 0
-					skidSound.Volume += (wantSkid - skidSound.Volume) * math.min(1, 10 * dt)
-					skidSound.PlaybackSpeed = 0.9 + math.clamp(scrub / 60, 0, 0.25)
-					if skidSound.Volume > 0.01 and not skidSound.IsPlaying then
-						skidSound:Play()
-					elseif skidSound.Volume <= 0.01 and skidSound.IsPlaying then
-						skidSound:Stop()
-					end
+					local soundOn = val("FunCarSounds", true)
+					local revs = engineSound(dt, forward, throttle, grounded, drifting, scrub, soundOn)
+					carFx(dt, revs, throttle, handbrake or (throttle < 0 and forward > 0.5), forward < -0.5, soundOn)
 
 					if speedLabel then
 						-- 1 stud = 0.28 m
@@ -54615,7 +55119,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				readSettings()
 				applySeatHeight()
 				if car and car.root == carRoot then
-					HuiGSync.SetLocal("car", true)
+					HuiGSync.SetLocal(CAR_MARKERS[name] or "car", true)
 				end
 			end
 
@@ -54629,7 +55133,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 				Default = 1,
 				AllowNull = false,
 				Multi = false,
-				ValueImages = { Car = "car" },
+				ValueImages = { Car = "car", Jet = "plane" },
 				Callback = function(arg)
 					if options.FunVehicle and VEHICLES[arg] then
 						options.FunVehicle:SetValues(sortedKeys(VEHICLES[arg]))
@@ -54654,8 +55158,11 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 			Garage:AddToggle("FunVehicleSpawn", {
 				Text = "Spawn Vehicle",
 				Default = false,
-				Tooltip = "WASD / thumbstick to drive, Space = handbrake",
+				Tooltip = "Car: WASD / thumbstick, Space = handbrake. Jet: W/S throttle, A/D roll, aim with the camera, jump to get out",
 				Callback = function(arg)
+					if jetToggleSync then
+						return -- the jet got in or out by itself; the toggle is only catching up
+					end
 					if arg then
 						task.spawn(spawnVehicle)
 					else
@@ -54667,22 +55174,25 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 
 			speedLabel = Garage:AddLabel("Speed: <b>0 km/h</b>")
 
-			CarSettings:AddToggle("FunVehicleDrift", {
+			-- Settings shows the selected vehicle type's settings: the car's here, the jet's added by the jet code
+			local CarBox = CarSettings:AddDependencyBox()
+			CarBox:SetupDependencies({ { options.FunVehicleType, "Car" } })
+			CarBox:AddToggle("FunVehicleDrift", {
 				Text = "Enable Drifting",
 				Default = false,
 				Tooltip = "Hold Space to drift: rear wheels lock and smoke, steering swings the tail",
 			})
-			CarSettings:AddToggle("FunCarSmoke", {
+			CarBox:AddToggle("FunCarSmoke", {
 				Text = "Tyre Smoke",
 				Default = true,
 			})
-			CarSettings:AddToggle("FunCarSounds", {
+			CarBox:AddToggle("FunCarSounds", {
 				Text = "Car Sounds",
 				Default = true,
 			})
-			CarSettings:AddDivider("Tuning")
+			CarBox:AddDivider("Tuning")
 			for _, s in ipairs(CAR_SETTINGS) do
-				CarSettings:AddSlider(s[1], {
+				CarBox:AddSlider(s[1], {
 					Text = s[2],
 					Default = s[3],
 					Min = s[4],
@@ -54692,7 +55202,7 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					Compact = true,
 				})
 			end
-			CarSettings:AddButton({
+			CarBox:AddButton({
 				Text = "Reset to Defaults",
 				Func = function()
 					for _, s in ipairs(CAR_SETTINGS) do
@@ -54704,12 +55214,15 @@ Rejoined: %rejoinedPlayer%, %listCount%]],
 					toggles.FunCarSounds:SetValue(true)
 				end,
 			})
-
+			local JetBox = CarSettings:AddDependencyBox()
+			JetBox:SetupDependencies({ { options.FunVehicleType, "Jet" } })
+			tbl12.FunJetSettings = JetBox
 			lib:OnUnload(function()
 				vehicleToken += 1
 				despawnVehicle()
 				removeBuilding()
 			end)
+			end)()
 		end
 	end
 
@@ -59402,41 +59915,9 @@ end
 																																																	rawset(arg, arg2, arg3)
 																																																end })
 
-																																																v75 = Peak:AddLeftGroupbox("<b>JET</b>", "plane")
-												v75:AddDivider()
-												v75:AddLabel("<b>Use Anti Kick</b>")
-
-																																																v75:AddDropdown("JetSelect", {
-																																																	Text = "Select Jet",
-																																																	Values = {
-																																																		"F22 Raptor",
-																																																	},
-																																																	Default = 1,
-																																																	AllowNull = false,
-																																																	Multi = false,
-																																																	ValueImages = {
-																																																		["F22 Raptor"] = "plane",
-																																																	},
-																																																	Callback = function(arg)
-																																																		if not arg or arg == "" then
-																																																			task.defer(function()
-																																																				if options.JetSelect then
-																																																					options.JetSelect:SetValue("F22 Raptor")
-																																																				end
-																																																			end)
-																																																		end
-																																																	end,
-																																																})
-
-																																																v75:AddButton({
-																																																	Text = "Spawn Selected Jet",
-																																																	Func = function()
-																																																		if _JET._clickCb then
-																																																			_JET._clickCb()
-																																																		end
-																																																	end,
-																																																})
-
+																																																-- shown in the Vehicle Garage's Settings tab while Jet is selected (spawned from the garage)
+																																																v75 = tbl12.FunJetSettings or Peak:AddLeftGroupbox("<b>JET</b>", "plane")
+																																																v75:AddLabel("<b>Use Anti Kick</b>")
 																																																v75:AddLabel("Jet Spawn Keybind"):AddKeyPicker("JetSpawnKeybind", {
 																																																	Default = "None",
 																																																	Mode = "Toggle",
@@ -59931,6 +60412,9 @@ end
 																																																								character5 = character6
 																																																								flag48 = false
 																																																								_JET.mounted = false
+																																																								if tbl12.OnJetMounted then
+																																																									tbl12.OnJetMounted(false)
+																																																								end
 																																																								v75 = nil
 																																																								weld = nil
 																																																								connection6 = nil
@@ -60496,6 +60980,9 @@ end
 																																																							weld.C1 = CFrame.identity
 																																																							flag48 = true
 																																																							_JET.mounted = true
+																																																							if tbl12.OnJetMounted then
+																																																								tbl12.OnJetMounted(true)
+																																																							end
 																																																							local humanoid4 = character5:FindFirstChildOfClass("Humanoid")
 
 																																																							if humanoid4 then
@@ -60525,6 +61012,9 @@ end
 																																																									v75 = nil
 																																																									flag48 = false
 																																																									_JET.mounted = false
+																																																									if tbl12.OnJetMounted then
+																																																										tbl12.OnJetMounted(false)
+																																																									end
 																																																									n41 = 0
 																																																									n42 = 0
 																																																									n52 = 0
@@ -60600,6 +61090,9 @@ end
 																																																							end
 																																																							flag48 = false
 																																																							_JET.mounted = false
+																																																							if tbl12.OnJetMounted then
+																																																								tbl12.OnJetMounted(false)
+																																																							end
 
 																																																							if connection6 then
 																																																								connection6:Disconnect()
@@ -60772,6 +61265,17 @@ end
 																																																							btnSpawn.TextColor3 = Color3.fromRGB(210, 210, 210)
 																																																						end
 
+																																																						-- for the Vehicle Garage (Fun tab): get in / get out, without the button's unmount-then-respawn
+																																																						_JET.spawn = function()
+																																																							pcall(function()
+																																																								doSpawn()
+																																																								task.wait(0.2)
+																																																								doMount()
+																																																							end)
+																																																						end
+																																																						_JET.unmount = function()
+																																																							pcall(doUnmount)
+																																																						end
 																																																						btnSpawn.MouseButton1Click:Connect(function()
 																																																							if flag48 then
 																																																								local ok, result = pcall(doUnmount)
@@ -60918,6 +61422,9 @@ end
 
 																																																							flag48 = false
 																																																							_JET.mounted = false
+																																																							if tbl12.OnJetMounted then
+																																																								tbl12.OnJetMounted(false)
+																																																							end
 																																																							v75 = nil
 																																																							weld = nil
 																																																							connection6 = nil
